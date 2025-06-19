@@ -696,23 +696,34 @@ class Network(ABC):
     def get_fault_data(
             self,
             busx_id: str,
-            fault_id: str,
             fault_type: str
     ) -> tuple[dict, float]:
-        """Retrieve and return fault data at certain bus."""
-        fault_data: dict[str, list[str, np.ndarray, np.ndarray]] = {}
+        """Retrieve and return fault data at certain bus.
+
+        It retains magnitude of fault current only and due to
+        unbalance network it gets the highest phase current measured.
+
+        It slices half the array because one terminal is enough.
+
+        """
+        fault_data: dict[str, list[str, float, np.ndarray]] = {}
         # Retrieve data during fault
         dssBus = self.dss.ActiveCircuit.ActiveBus(busx_id)
         bus_voltage = dssBus.VMagAngle   # VLN-Magnitude [V], angle [deg]
         bus_distance = dssBus.Distance   # [km]
-        dssFault = (
-            self.dss.ActiveCircuit.ActiveCktElement(fault_id)
-        )
-        Isc = dssFault.CurrentsMagAng   # [A]
+        Isc = 0.0                        # [A]
+        for branch in dssBus.AllPDEatBus:
+            if branch:
+                dssBranch = self.dss.ActiveCircuit.ActiveElement(branch)
+                currents = dssBranch.CurrentsMagAng
+                current_phasor = currents[:len(currents)//2]
+                phase_current_mag = current_phasor[::2]
+                # Add up most severe phase current magnitude.
+                Isc += max(phase_current_mag)
         fault_data[fault_type] = [
             busx_id,
-            bus_voltage,
-            Isc[:len(Isc)//2]
+            Isc,
+            bus_voltage
         ]
         return fault_data, bus_distance
 
@@ -741,6 +752,10 @@ class Network(ABC):
             Fault gets disabled after its data is
             collected and set it as circuit attribute.
 
+        .. warning::
+            Both ``Vsourcebus`` and renamed third 
+            floating winding ``hvmv_3`` are skiped.
+
         """
         dssCircuit = self.dss.ActiveCircuit
         try:
@@ -757,22 +772,25 @@ class Network(ABC):
             print(f"MaxIterReached: {e}.")
         else:
             for busx, (fault_types, terminals) in kwargs.items():
+                if "sourcebus" in busx.lower():
+                    continue
+                if "hvmv_3" in busx.lower():
+                    continue
                 for fault_type in fault_types:
                     # Set fault
                     fault_id = self.set_fault(
                         busx, fault_type, terminals
                     )
                     self.dss.ActiveCircuit.Solution.Solve()
+                    # Remove fault
+                    dssCircuit.Disable(fault_id)
                     # Retrieve data
                     fault_data, distance = self.get_fault_data(
                         busx_id=busx,
-                        fault_id=fault_id,
                         fault_type=fault_type
                     )
                     # Store data
                     self.ckt_faults.append((fault_data, distance))
-                    # Remove fault
-                    dssCircuit.Disable(fault_id)
         finally:
             self.ckt_faults.sort(key=lambda x: x[1])   # Sort by distance
             # Set back active circuit to last steady state
@@ -798,30 +816,36 @@ class Network(ABC):
         for faults, distance in self.ckt_faults:
             if "LLLG" in faults:
                 three_phase_fault.append(
-                    (faults['LLLG'][-1][0], distance)
+                    (faults['LLLG'][1],
+                    distance, faults['LLLG'][0])
                 )
 
             if "LG" in faults:
                 single_phase_fault.append(
-                    (faults['LG'][-1][0], distance)
+                    (faults['LG'][1],
+                    distance, faults['LG'][0])
                 )
 
             if "LLG_a" in faults:
                 complex_double_fault.append(
-                    (faults['LLG_a'][-1][0], distance)
+                    (faults['LLG_a'][1],
+                    distance, faults['LLG_a'][0])
                 )
 
             if "LLG_b" in faults:
                 simple_double_fault.append(
-                    (faults['LLG_b'][-1][0], distance)
+                    (faults['LLG_b'][1],
+                    distance, faults['LLG_b'][0])
                 )
 
             if "LL" in faults:
                 float_double_fault.append(
-                    (faults['LL'][-1][0], distance)
+                    (faults['LL'][1],
+                    distance, faults['LL'][0])
                 )
         # Vectorize: (Isc [A], distance [km])
         fault_data: list[np.ndarray[float, float]] = []
+        fault_buses: list[list[str]] = []
         for fault in [
             three_phase_fault,
             single_phase_fault,
@@ -834,11 +858,13 @@ class Network(ABC):
             )
             currents = [c[0] for c in fault]
             distances = [d[1] for d in fault]
+            buses_id = [b[2] for b in fault]
             fault_matrix[:, 0] = currents
             fault_matrix[:, 1] = distances
             fault_data.append(fault_matrix)
+            fault_buses.append(buses_id)
 
-        return fault_data
+        return fault_data, fault_buses
 
 
 @dataclass()
