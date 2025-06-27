@@ -184,6 +184,8 @@ class Network(ABC):
     power_monitors_id:  list[str] = field(default_factory=list)
     losses_monitors_id:  list[str] = field(default_factory=list)
     head_meters_id:  list[str] = field(default_factory=list)
+    mv_buses_id: list[str] = field(default_factory=list)
+    lv_buses_id: list[str] = field(default_factory=list)
     ckt_losses: np.ndarray[float] | None = None
     ckt_faults: list[
         tuple[dict[str, list[str, np.ndarray, np.ndarray]], float]
@@ -457,7 +459,7 @@ class Network(ABC):
             Ensure to call this method in the proper
             monitoring kind of mode.
 
-        .. note::
+        .. Note::
             DER devices full names are internally retained.
 
         """
@@ -663,7 +665,7 @@ class Network(ABC):
     ) -> str:
         """Define and model a fault element.
 
-        .. note::
+        .. Note::
             Number of nodes of bus must be equal
             or greater than number of phases of
             the requested fault.
@@ -752,10 +754,6 @@ class Network(ABC):
             Fault gets disabled after its data is
             collected and set it as circuit attribute.
 
-        .. warning::
-            Both ``Vsourcebus`` and renamed third 
-            floating winding ``hvmv_3`` are skiped.
-
         """
         dssCircuit = self.dss.ActiveCircuit
         try:
@@ -772,10 +770,6 @@ class Network(ABC):
             print(f"MaxIterReached: {e}.")
         else:
             for busx, (fault_types, terminals) in kwargs.items():
-                if "sourcebus" in busx.lower():
-                    continue
-                if "hvmv_3" in busx.lower():
-                    continue
                 for fault_type in fault_types:
                     # Set fault
                     fault_id = self.set_fault(
@@ -800,7 +794,7 @@ class Network(ABC):
 
     def get_fault_currents(
             self,
-    ) -> list[np.ndarray[float, float]]:
+    ) -> tuple[list[np.ndarray[float, float]], list[list[str]]]:
         """Filter short circuit phase current magnitude."""
         # LLL-G: Three phase bolted Fault
         three_phase_fault = []
@@ -902,11 +896,31 @@ class BaseCicuit(Network, Circuit):
         Filter out fault types regarding the number of nodes
         of bus. Finally add up DER short current contribution.
 
+        Classify MV buses and LV ones.
+
+        .. Note::
+            Above voltage magnitude of 30kV LL it is considered
+            medium voltage.
+
+        .. warning::
+        Both ``Vsourcebus`` and renamed third 
+        floating winding ``hvmv_3`` are skiped.
+
         """
         fault_buses = {}
         for bus_id in self.dss.ActiveCircuit.AllBusNames:
+            if "sourcebus" in bus_id.lower():
+                continue
+            if "hvmv_3" in bus_id.lower():
+                continue
             dssBus = self.dss.ActiveCircuit.ActiveBus(bus_id)
             nodes = dssBus.Nodes
+            voltages = dssBus.VMagAngle  # mag VLN [V], phase [Deg]
+            if all(voltages[::2] >= 30.0e3/np.sqrt(3)):
+                self.mv_buses_id.append(bus_id)
+            else:
+                self.lv_buses_id.append(bus_id)
+
             terminals = [f".{n}" for n in nodes if n]
             if len(nodes) == 1:
                 fault_buses[bus_id] = (['LG'], terminals)
@@ -1091,12 +1105,36 @@ class DERCircuit(Network, Circuit):
     def fault_network(
             self
     ):
-        """Run fault study of short circuit all across the circuit."""
+        """Run fault study of short circuit all across the circuit.
+
+        Filter out fault types regarding the number of nodes
+        of bus. Finally add up DER short current contribution.
+
+        Classify MV buses and LV ones.
+
+        .. Note::
+            Above voltage magnitude of 30kV LL it is considered
+            medium voltage.
+
+        .. warning::
+        Both ``Vsourcebus`` and renamed third 
+        floating winding ``hvmv_3`` are skiped.
+
+        """
         fault_buses = {}
         for bus_id in self.dss.ActiveCircuit.AllBusNames:
-            # Filter out fault types regarding kind of bus
+            if "sourcebus" in bus_id.lower():
+                continue
+            if "hvmv_3" in bus_id.lower():
+                continue
             dssBus = self.dss.ActiveCircuit.ActiveBus(bus_id)
             nodes = dssBus.Nodes
+            voltages = dssBus.VMagAngle  # mag VLN [V], phase [Deg]
+            if all(voltages[::2] >= 30.0e3/np.sqrt(3)):
+                self.mv_buses_id.append(bus_id)
+            else:
+                self.lv_buses_id.append(bus_id)
+
             terminals = [f".{n}" for n in nodes if n]
             if len(nodes) == 1:
                 fault_buses[bus_id] = (['LG'], terminals)
