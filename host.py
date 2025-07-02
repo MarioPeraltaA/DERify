@@ -91,7 +91,7 @@ class GISCircuit(ABC):
         """Fill layers up.
 
         Shapefile name may be: ``<xxxx>_<name>``.
-    
+
         """
         shapefiles = glob.glob(self.gis_path)
         for shp in shapefiles:
@@ -157,13 +157,6 @@ class GISCircuit(ABC):
         folium.TileLayer("Cartodb dark_matter", show=False).add_to(ckt_map)
         folium.LayerControl().add_to(ckt_map)
         return ckt_map
-
-
-@dataclass()
-class Graph(GISCircuit):
-    """Topology analysis."""
-
-    pass
 
 
 @dataclass()
@@ -811,31 +804,31 @@ class Network(ABC):
             if "LLLG" in faults:
                 three_phase_fault.append(
                     (faults['LLLG'][1],
-                    distance, faults['LLLG'][0])
+                     distance, faults['LLLG'][0])
                 )
 
             if "LG" in faults:
                 single_phase_fault.append(
                     (faults['LG'][1],
-                    distance, faults['LG'][0])
+                     distance, faults['LG'][0])
                 )
 
             if "LLG_a" in faults:
                 complex_double_fault.append(
                     (faults['LLG_a'][1],
-                    distance, faults['LLG_a'][0])
+                     distance, faults['LLG_a'][0])
                 )
 
             if "LLG_b" in faults:
                 simple_double_fault.append(
                     (faults['LLG_b'][1],
-                    distance, faults['LLG_b'][0])
+                     distance, faults['LLG_b'][0])
                 )
 
             if "LL" in faults:
                 float_double_fault.append(
                     (faults['LL'][1],
-                    distance, faults['LL'][0])
+                     distance, faults['LL'][0])
                 )
         # Vectorize: (Isc [A], distance [km])
         fault_data: list[np.ndarray[float, float]] = []
@@ -860,6 +853,151 @@ class Network(ABC):
 
         return fault_data, fault_buses
 
+
+@dataclass()
+class CktGraph(ABC):
+    """Skeleton factory."""
+
+    ckt: Network
+    vertices: list[str] = field(default_factory=list)
+    edges: list[tuple[str, str]] = field(default_factory=list)
+    adj: dict[str, list[str]] = field(default_factory=dict)
+
+    def __post_init__(self):
+        self.set_adjacency_list()
+
+    def add_vertex(
+        self,
+        vertex_id: str
+    ) -> str:
+        """Instantiate vertex.
+
+        Vertex is a unique bus of the circuit in spite
+        of its nodes.
+
+        .. Note::
+            In opendss a Bus may have multiple Nodes.
+
+        """
+        if vertex_id not in self.vertices:
+            self.vertices.append(vertex_id)
+
+    def add_edge(
+        self,
+        from_vertex: str,
+        to_vertex: str
+    ):
+        """Instantiate edge.
+
+        Edge is a branch with two ends. i.e. Connection
+        between two vertices.
+
+        """
+        self.add_vertex(from_vertex)
+        self.add_vertex(to_vertex)
+        edge = (from_vertex, to_vertex)
+        if edge not in self.edges:
+            self.edges.append(edge)
+
+    def untwist_branch(
+            self,
+            buses: list[str],
+    ):
+        """Cope with odd branches.
+
+        Odd branches (more than two ends/terminals) such
+        as three phase three winding transformer are taken
+        as a cycle graph third order :math:`C_{3}`.
+
+        """
+        branches = [
+            (buses[i], buses[(i + 1) % len(buses)]) for i in range(len(buses))
+        ]
+        for edge in branches:
+            self.add_edge(edge[0], edge[1])
+
+    def collect_branches(
+            self
+    ):
+        """Gather branches in all zones seen by Meters."""
+        dssMeters = self.ckt.dss.ActiveCircuit.Meters
+        i = dssMeters.First
+        branches: list[str] = []
+        while i:
+            branches += dssMeters.AllBranchesInZone
+            i = dssMeters.Next
+        return branches
+
+    def build_graph(
+            self
+    ):
+        """Generate undirected graph."""
+        branches = self.collect_branches()
+        dssCircuit = self.ckt.dss.ActiveCircuit
+        for edge in branches:
+            if edge:
+                dssBranch = dssCircuit.ActiveCktElement(edge)
+                nodes = dssBranch.BusNames
+                # Strip specific nodes
+                buses = [node.split(".")[0] for node in nodes]
+                if len(set(buses)) != 2:
+                    self.untwist_branch(buses)
+                else:
+                    self.add_edge(buses[0], buses[1])
+
+    def set_adjacency_list(
+            self
+    ):
+        """Graph representation."""
+        self.build_graph()
+        self.adj = {
+            v: [] for v in self.vertices
+        }
+        for edge in self.edges:
+            self.adj[edge[0]].append(edge[1])
+            self.adj[edge[1]].append(edge[0])
+
+    def dfs_edges(
+            self,
+            root: str | None = "sourcebus"
+    ):
+        """Run full traversal Depth First Search.
+
+        To traverse graph. If ``root`` (source) is provided
+        then yield only edges in the component reachable
+        from source. This pattern mimics `networkX <https://networkx.org/>`_.
+        See [1]_ and [2]_.
+
+        References
+        ----------
+        .. [1] http://www.ics.uci.edu/~eppstein/PADS
+        .. [2] https://en.wikipedia.org/wiki/Depth-limited_search
+
+        """
+        if root is None:
+            # Edges for all components
+            vertices = self.vertices
+        else:
+            # Edges for components with source
+            vertices = [root]
+        visited = set()
+        for start in vertices:
+            if start in visited:
+                continue
+            visited.add(start)
+            stack = [(start, self.adj[start])]
+            while stack:
+                parent, children = stack[-1]
+                for child in children:
+                    if child not in visited:
+                        # Discovered edge
+                        yield parent, child
+                        visited.add(child)
+                        # Add child and grandchildren to stack
+                        stack.append((child, self.adj[child]))
+                        break
+                else:
+                    stack.pop()
 
 @dataclass()
 class BaseCicuit(Network, Circuit):
@@ -903,7 +1041,7 @@ class BaseCicuit(Network, Circuit):
             medium voltage.
 
         .. warning::
-        Both ``Vsourcebus`` and renamed third 
+        Both ``Vsourcebus`` and renamed third
         floating winding ``hvmv_3`` are skiped.
 
         """
@@ -1117,7 +1255,7 @@ class DERCircuit(Network, Circuit):
             medium voltage.
 
         .. warning::
-        Both ``Vsourcebus`` and renamed third 
+        Both ``Vsourcebus`` and renamed third
         floating winding ``hvmv_3`` are skiped.
 
         """
