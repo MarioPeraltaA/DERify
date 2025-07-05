@@ -92,11 +92,23 @@ class GISCircuit(ABC):
 
         Shapefile name may be: ``<xxxx>_<name>``.
 
+        .. warning::
+            Filter out those layers (geodataframes) with no rows.
+
         """
         shapefiles = glob.glob(self.gis_path)
+        shapefiles.sort(reverse=True)
         for shp in shapefiles:
             name = shp.split("/")[-1].split(".")[0].split("_")[-1]
-            self.layers[name] = [self.read_gis(shp)]
+            gdf = self.read_gis(shp)
+            try:
+                if not gdf.shape[0]:
+                    raise ValueError(f"No values in {name}")
+            except ValueError as e:
+                print(f"EmptyGeoDataFrame: {e}.")
+                continue
+            else:
+                self.layers[name] = [gdf]
 
     def allocate_layers_color(
             self,
@@ -123,7 +135,11 @@ class GISCircuit(ABC):
     def explore_ckt(
             self
     ) -> folium.Map:
-        """Map of the circuit."""
+        """Map of the circuit.
+
+        Compute ceneter to start up the map.
+
+        """
         # Get center location
         y_avg = np.average(
             [lay[0].geometry.union_all().centroid.y
@@ -133,7 +149,7 @@ class GISCircuit(ABC):
             [lay[0].geometry.union_all().centroid.x
              for lay in self.layers.values()]
         )
-        center = [y_avg, x_avg]
+        center = [y_avg, x_avg]   # [latitude, longitude]
         ckt_map = folium.Map(
             crs="EPSG3857",
             zoom_start=15,
@@ -176,6 +192,7 @@ class Network(ABC):
     der_dummy_names: list = field(default_factory=list)
     power_monitors_id:  list[str] = field(default_factory=list)
     losses_monitors_id:  list[str] = field(default_factory=list)
+    volt_curr_monitors_id: list[str] = field(default_factory=list)
     head_meters_id:  list[str] = field(default_factory=list)
     mv_buses_id: list[str] = field(default_factory=list)
     lv_buses_id: list[str] = field(default_factory=list)
@@ -237,7 +254,8 @@ class Network(ABC):
             full_name_element: str = "transformer.substation",
             monitor_id: str = "substation_monitor_1",
             terminal: int = 1,
-            mode: int = enums.MonitorModes.Power
+            mode: int = enums.MonitorModes.Power,
+            polar: bool = False
     ) -> str:
         """Instantiate and set a single monitor."""
         dssMonitors = self.dss.ActiveCircuit.Monitors
@@ -245,7 +263,11 @@ class Network(ABC):
         if monitor_id in monitors_id:
             return monitor_id
 
-        self.dss.Text.Command = f"new monitor.{monitor_id} ppolar=no"
+        if mode == enums.MonitorModes.VI:
+            notation = "VIpolar"
+        else:
+            notation = "ppolar"
+        self.dss.Text.Command = f"new monitor.{monitor_id} {notation}={polar}"
         dssMonitors.Name = monitor_id
         dssMonitors.Element = full_name_element
         dssMonitors.Terminal = terminal
@@ -315,7 +337,7 @@ class Network(ABC):
             self,
             monitor_id: str = "feeder_pq",
             reset: bool = True
-    ):
+    ) -> np.ndarray:
         """Key and retrieve monitor's data.
 
         Active Circuit must be run already.
@@ -475,6 +497,30 @@ class Network(ABC):
                 self.losses_monitors_id.append(monitor_id)
                 i = self.dss.ActiveCircuit.NextPCElement()
 
+    def deploy_switches_monitors(
+            self
+    ):
+        """Embed voltage-current monitor to SwitchedObj."""
+        dssSwitch = self.dss.ActiveCircuit.SwtControls
+        switched_objs = []
+        i = dssSwitch.First
+        while i:
+            switched_objs.append(dssSwitch.SwitchedObj)
+            i = dssSwitch.Next
+        if not switched_objs:
+            return
+        else:
+            for full_name in switched_objs:
+                obj_name = full_name.split(".")[-1]
+                monitor_id = self.set_monitor(
+                    full_name_element=full_name,
+                    monitor_id=f"monitor_{obj_name}_vi",
+                    terminal=1,
+                    mode=enums.MonitorModes.VI,
+                    polar=True
+                )
+                self.volt_curr_monitors_id.append(monitor_id)
+
     def external_network_power(
             self,
     ) -> np.ndarray[float]:
@@ -528,7 +574,7 @@ class Network(ABC):
             actitive or reactive it is seen as a surplus.
 
         .. Note::
-            No external network contribution.
+            Without external network contribution, so far.
 
         """
         delta_matrix = np.zeros(
@@ -549,6 +595,20 @@ class Network(ABC):
             return
         else:
             return -delta_matrix
+
+    def get_voltage_profiles(
+            self
+    ) -> dict[str, np.ndarray]:
+        """Get VI daily data from switched objects.
+
+        These may be critical lines or bridges.
+
+        """
+        data: dict[str, np.ndarray] = {}
+        for monitor_id in self.volt_curr_monitors_id:
+            measures = self.get_monitor_data(monitor_id)
+            data[monitor_id] = measures
+        return data
 
     def three_phase_fault(
             self,
@@ -999,6 +1059,7 @@ class CktGraph(ABC):
                 else:
                     stack.pop()
 
+
 @dataclass()
 class BaseCicuit(Network, Circuit):
     """Current circuit."""
@@ -1010,6 +1071,7 @@ class BaseCicuit(Network, Circuit):
                 self.add_head_meters()
                 self.add_head_monitors()          # Power monitors
                 self.deploy_pce_monitors(mode=9)  # Losses monitors
+                self.deploy_switches_monitors()   # VI monitors
                 self.dss.ActiveCircuit.Solution.Solve()
             else:
                 raise RuntimeError("Circuit must be initialized")
@@ -1041,8 +1103,8 @@ class BaseCicuit(Network, Circuit):
             medium voltage.
 
         .. warning::
-        Both ``Vsourcebus`` and renamed third
-        floating winding ``hvmv_3`` are skiped.
+            Both ``Vsourcebus`` and renamed third
+            floating winding ``hvmv_3`` are skiped.
 
         """
         fault_buses = {}
@@ -1093,6 +1155,7 @@ class DERCircuit(Network, Circuit):
                 self.add_head_meters()
                 self.add_head_monitors()          # Power monitors
                 self.deploy_pce_monitors(mode=9)  # Losses monitors
+                self.deploy_switches_monitors()   # VI monitors
                 self.dss.ActiveCircuit.Solution.Solve()
             else:
                 raise RuntimeError("Circuit must be initialized")
@@ -1208,7 +1271,7 @@ class DERCircuit(Network, Circuit):
         """Turn off BESS elements.
 
         .. warning::
-            Disable element thorugh full name.
+            Disable element through full name.
 
         """
         dssStorage = self.dss.ActiveCircuit.Storages
@@ -1255,8 +1318,8 @@ class DERCircuit(Network, Circuit):
             medium voltage.
 
         .. warning::
-        Both ``Vsourcebus`` and renamed third
-        floating winding ``hvmv_3`` are skiped.
+            Both ``Vsourcebus`` and renamed third
+            floating winding ``hvmv_3`` are skiped.
 
         """
         fault_buses = {}
