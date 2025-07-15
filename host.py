@@ -149,7 +149,7 @@ class GISCircuit(ABC):
             [lay[0].geometry.union_all().centroid.x
              for lay in self.layers.values()]
         )
-        center = [y_avg, x_avg]   # [latitude, longitude]
+        center = [y_avg, x_avg]
         ckt_map = folium.Map(
             crs="EPSG3857",
             zoom_start=15,
@@ -565,7 +565,7 @@ class Network(ABC):
             - If negative active power, then the element generates
             real power [kW].
             - If positive reactive power, then the element
-            absorves reactive [kVAr].
+            absorbs reactive [kVAr].
 
         Returns
         -------
@@ -974,6 +974,8 @@ class CktGraph(ABC):
             (buses[i], buses[(i + 1) % len(buses)]) for i in range(len(buses))
         ]
         for edge in branches:
+            if "hvmv_3" in edge:
+                continue
             self.add_edge(edge[0], edge[1])
 
     def collect_branches(
@@ -1167,7 +1169,7 @@ class DERCircuit(Network, Circuit):
             dispatch_curve_id: str = "dispatch_shape",
             npts: int = 96,
             minterval: int = 15,
-            hours_soc: tuple[tuple, tuple] = ((1, 5), (18, 22))
+            hours_soc: tuple[tuple, tuple] = ((1, 5), (17, 20.4))
     ):
         """Define dynamically LoadShape.
 
@@ -1212,8 +1214,7 @@ class DERCircuit(Network, Circuit):
             per_stored: float = 10.0,
             per_reserve: float = 10.0,
             dispatch_mode: str = "follow",
-            per_efficiencies: tuple[float] = (95.0, 95.0),
-            triggers: tuple[float] = (0.95, 0.20)
+            per_efficiencies: tuple[float] = (95.0, 95.0)
     ):
         """Integrate BESS to the circuit."""
         self.set_bess_dispatch_curve(daily_id)
@@ -1224,7 +1225,6 @@ class DERCircuit(Network, Circuit):
             f"%reserve={per_reserve} "
             f"%effcharge={per_efficiencies[0]} "
             f"%effdischarge={per_efficiencies[1]} "
-            f"DischargeTrigger={triggers[0]} ChargeTrigger={triggers[1]} "
             f"dispmode={dispatch_mode} "
             f"model={model} daily={daily_id}"
         )
