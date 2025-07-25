@@ -502,19 +502,21 @@ class Network(ABC):
     ):
         """Embed voltage-current monitor to SwitchedObj."""
         dssSwitch = self.dss.ActiveCircuit.SwtControls
-        switched_objs = []
+        switched_objs: list[tuple] = []
         i = dssSwitch.First
         while i:
-            switched_objs.append(dssSwitch.SwitchedObj)
+            switched_objs.append(
+                (dssSwitch.Name, dssSwitch.SwitchedObj)
+            )
             i = dssSwitch.Next
         if not switched_objs:
             return
         else:
-            for full_name in switched_objs:
-                obj_name = full_name.split(".")[-1]
+            for switch_id, full_name in switched_objs:
+                switch_number = switch_id.split("_")[-1]
                 monitor_id = self.set_monitor(
                     full_name_element=full_name,
-                    monitor_id=f"monitor_{obj_name}_vi",
+                    monitor_id=f"monitor_{switch_number}_vi",
                     terminal=1,
                     mode=enums.MonitorModes.VI,
                     polar=True
@@ -1145,6 +1147,7 @@ class DERCircuit(Network, Circuit):
     pvsys_attrs: list[dict] = field(default_factory=list)
     storages_id: list[str] = field(default_factory=list)
     pvsystems_id: list[str] = field(default_factory=list)
+    volt_curr_der_monitors: list[str] = field(default_factory=list)
 
     def __post_init__(self):
         """Add DER and then monitors."""
@@ -1158,18 +1161,42 @@ class DERCircuit(Network, Circuit):
                 self.add_head_monitors()          # Power monitors
                 self.deploy_pce_monitors(mode=9)  # Losses monitors
                 self.deploy_switches_monitors()   # VI monitors
+                self.deploy_bess_monitors()       # VI monitors
                 self.dss.ActiveCircuit.Solution.Solve()
             else:
                 raise RuntimeError("Circuit must be initialized")
         except RuntimeError as e:
             print(f"NonSolvedCkt: {e}.")
 
+    def deploy_bess_monitors(
+            self
+    ):
+        """Embed voltage-current monitor to BESS."""
+        dssStorage = self.dss.ActiveCircuit.Storages
+        storage_objs: list[str] = dssStorage.AllNames
+
+        if not storage_objs:
+            return
+        else:
+            for id in storage_objs:
+                if id:
+                    monitor_id = self.set_monitor(
+                        full_name_element=f"Storage.{id}",
+                        monitor_id=f"bess_monitor_{id}_vi",
+                        terminal=1,
+                        mode=enums.MonitorModes.VI,
+                        polar=True
+                    )
+                    self.volt_curr_der_monitors.append(monitor_id)
+
     def set_bess_dispatch_curve(
             self,
             dispatch_curve_id: str = "dispatch_shape",
             npts: int = 96,
             minterval: int = 15,
-            hours_soc: tuple[tuple, tuple] = ((1, 5), (17, 20.4))
+            hours_soc: tuple[tuple, tuple] = ((1, 5), (17, 20.4)),
+            charge_pace: float = 1.0,
+            discharge_pace: float = 1.0
     ):
         """Define dynamically LoadShape.
 
@@ -1190,15 +1217,17 @@ class DERCircuit(Network, Circuit):
         dssLoadShape.Npts = npts
         dssLoadShape.MinInterval = minterval
         dssLoadShape.UseActual = False
+        daily_dispatch = np.zeros(npts)
+
         # Charge (negative values)
         i = int(npts*hours_soc[0][0] / 24.0)
         j = int(npts*hours_soc[0][1] / 24.0)
         # Discharge (positive values)
         m = int(npts*hours_soc[1][0] / 24.0)
         n = int(npts*hours_soc[1][1] / 24.0)
-        daily_dispatch = np.zeros(npts)
-        daily_dispatch[i:j] = -1.0
-        daily_dispatch[m:n] = 1.0
+        daily_dispatch[i:j] = -1.0 * charge_pace
+        daily_dispatch[m:n] = 1.0 * discharge_pace
+
         dssLoadShape.Pmult = daily_dispatch
 
     def set_battery(
@@ -1214,10 +1243,18 @@ class DERCircuit(Network, Circuit):
             per_stored: float = 10.0,
             per_reserve: float = 10.0,
             dispatch_mode: str = "follow",
-            per_efficiencies: tuple[float] = (95.0, 95.0)
+            per_efficiencies: tuple[float] = (95.0, 95.0),
+            dispatch_schedule: tuple[tuple, tuple] = ((1, 5), (17, 20.4)),
+            charge_pace: float = 1.0,
+            discharge_pace: float = 1.0
     ):
         """Integrate BESS to the circuit."""
-        self.set_bess_dispatch_curve(daily_id)
+        self.set_bess_dispatch_curve(
+            dispatch_curve_id=daily_id,
+            hours_soc=dispatch_schedule,
+            charge_pace = charge_pace,
+            discharge_pace = discharge_pace
+        )
         self.dss.Text.Command = (
             f"New Storage.{storage_id} phases={phases} "
             f"bus1={bus_id} kV={kV} "
