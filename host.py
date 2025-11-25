@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
 from dss import dss, enums, IDSS
 import numpy as np
+import re
 # GIS
 import glob
 import folium
@@ -38,10 +39,12 @@ class Circuit(ABC):
 
     @abstractmethod
     def calculate_losses(self):
+        """Compute losses regarding scenario."""
         ...
 
     @abstractmethod
     def fault_network(self):
+        """Run fault study regardomg scenario."""
         ...
 
 
@@ -59,31 +62,56 @@ class GISCircuit(ABC):
     ):
         """Retrieve and set layers."""
         self.get_layers()
-        self.allocate_layers_color()  # In place
+        self.paint_layers()  # In place
 
     def read_gis(
-            self,
-            path: str,
-            epsg: int = 5367,
-            inplace: bool = False
-    ) -> gpd.GeoDataFrame:
-        """Set the leaf up.
+        self,
+        path: str,
+        epsg: int = 5367,
+        to_local: bool = False
+    ) -> gpd.GeoDataFrame | None:
+        """Read a GIS file and return a GeoDataFrame with a consistent CRS.
 
-        Ensure CRS is EPSG:4326 for folium compatibility.
-        Returns a copy to EPSG:5367 due to
-        utility-scale electrical modeling in Costa Rica
-        if inplaced.
+        By default, the data is returned in EPSG:4326 (WGS84), which is
+        required for Folium compatibility. If ``to_local=True``, the data
+        is reprojected to the specified local EPSG code, typically used
+        for utility-scale electrical modeling (e.g., EPSG:5367 in Costa Rica).
+
+        Parameters
+        ----------
+        path : str
+            File path to the GIS data.
+        epsg : int, optional
+            EPSG code of the local projection to use. Default is 5367.
+        to_local : bool, optional
+            If True, the GeoDataFrame is returned in the local projection.
+            If False (default), it is returned in EPSG:4326.
+
+        Returns
+        -------
+        geopandas.GeoDataFrame or None
+            GeoDataFrame in the requested CRS, or None if reading fails.
 
         """
         try:
             gdf = gpd.read_file(path)
-        except TypeError as e:
-            print(f"ErrorReadingFile: {path}. {e.args}")
-        else:
-            if gdf.crs.to_epsg() != epsg:
-                return (
-                    gdf.to_crs(epsg=epsg) if inplace else gdf.to_crs(epsg=4326)
-                )
+        except Exception as e:
+            print(f"Error reading GIS file '{path}': {e}")
+            return None
+
+        current_epsg = gdf.crs.to_epsg()
+        if current_epsg is None:
+            logg = (
+                f"Warning: No CRS found in '{path}'. "
+                "Returning raw GeoDataFrame."
+            )
+            print(logg)
+            return gdf
+
+        target_epsg = epsg if to_local else 4326
+        if current_epsg != target_epsg:
+            return gdf.to_crs(epsg=target_epsg)
+        return gdf
 
     def get_layers(
             self,
@@ -110,11 +138,11 @@ class GISCircuit(ABC):
             else:
                 self.layers[name] = [gdf]
 
-    def allocate_layers_color(
+    def paint_layers(
             self,
             seed: int = 7859
     ) -> dict[str, list[str, str]]:
-        """Asign eye-cathing color to each layer.
+        """Assign eye-cathing color to each layer.
 
         Uses ``rng.shuffle`` instead of ``rng.integers`` to make sure
         all colors are different.
@@ -177,7 +205,27 @@ class GISCircuit(ABC):
 
 @dataclass()
 class Network(ABC):
-    """Abstract Base Class of Circuits (Manufacturer)."""
+    """Abstract Base Class of Circuits (Manufacturer).
+
+    The circuit electrical model.
+
+    There is only one *Head* i.e. **Adj. Degree** of
+    feeder is only and solely *one*.
+
+    .. warning::
+
+        Property :py:attr:`dss.Text.Command` when use ``compile``
+        modifies the directory's root and sets the model's directory
+        as the current one. So it is recommended to run it
+        afterwards.
+
+    .. warning::
+
+        Avoid to use command :py:attr:`dss.ActiveCircuit.AllBusNames`
+        as buses unique labels may come with *dots* and OpenDSS
+        split nodes from bus name at first dot.
+
+    """
 
     ckt_path: str = "./CKT/CKT_Daily.dss"
     solve_mode: int = enums.SolveModes.Daily
@@ -186,14 +234,16 @@ class Network(ABC):
     number: int = 96
     stepsize_min: int = 15
     to_solve: bool = True
-    feeders_power: np.ndarray[float] | None = None
+    feeder_power: np.ndarray[float] | None = None
     der_data = {"Storage": [], "PVSystem": []}
     der_names: list = field(default_factory=list)
     der_dummy_names: list = field(default_factory=list)
-    power_monitors_id:  list[str] = field(default_factory=list)
-    losses_monitors_id:  list[str] = field(default_factory=list)
-    volt_curr_monitors_id: list[str] = field(default_factory=list)
-    head_meters_id:  list[str] = field(default_factory=list)
+    power_monitors:  dict[str, str] = field(default_factory=dict)
+    losses_monitors:  dict[str, str] = field(default_factory=dict)
+    volt_curr_monitors: dict[str, str] = field(default_factory=dict)
+    switches_monitors: list[str] = field(default_factory=list)
+    head_monitor: str | None = None   # PWR
+    head_meter:  str | None = None
     mv_buses_id: list[str] = field(default_factory=list)
     lv_buses_id: list[str] = field(default_factory=list)
     ckt_losses: np.ndarray[float] | None = None
@@ -249,7 +299,7 @@ class Network(ABC):
         if self.to_solve:
             self.dss.ActiveCircuit.Solution.Solve()
 
-    def set_monitor(
+    def add_monitor(
             self,
             full_name_element: str = "transformer.substation",
             monitor_id: str = "substation_monitor_1",
@@ -274,7 +324,7 @@ class Network(ABC):
         dssMonitors.Mode = mode
         return monitor_id
 
-    def set_meter(
+    def add_meter(
             self,
             full_name_element: str = "transformer.substation",
             meter_id: str = "substation_meter",
@@ -288,7 +338,7 @@ class Network(ABC):
         )
         return meter_id
 
-    def add_head_monitors(
+    def add_head_monitor(
             self,
             source_bus_id: str = "sourcebus",
             terminal: int = 1,
@@ -296,23 +346,46 @@ class Network(ABC):
     ):
         """Deploy monitors to each PDE connected to sourcebus.
 
-        To keep an eye on external network.
+        To keep an eye on external network power.
 
         """
-        self.dss.ActiveCircuit.ActiveBus(source_bus_id)
+        ibus_obj = self.dss.ActiveCircuit.ActiveBus(source_bus_id)
+        pd_elements = ibus_obj.AllPDEatBus
         # Full name branches
-        feeder_branches = self.dss.ActiveCircuit.ActiveBus.AllPDEatBus
-        # Branches at source bus
-        for branch in feeder_branches:
-            if branch:
-                _ = self.dss.ActiveCircuit.SetActiveElement(branch)
-                element_id = self.dss.ActiveClass.Name
-                monitor_id = self.set_monitor(
-                    branch, f"{element_id}_monitor_{mode}", terminal, mode
-                )
-                self.power_monitors_id.append(monitor_id)
+        pd_elements = self.dss.ActiveCircuit.ActiveBus.AllPDEatBus
+        pd_elements = [
+            None if (e) and (e.lower() in {"none", "nan", "null"}) else e
+            for e in pd_elements
+        ]
+        # Kick out falsy items
+        feeder_branches = list(filter(None, pd_elements))
+        # Add monitor
+        try:
+            if feeder_branches:
+                n_branches = len(feeder_branches)
+                if n_branches != 1:
+                    raise TypeError("Multiple branches at head.")
+            else:
+                raise ValueError("No PDE at feeder.")
+        except ValueError as e:
+            logg = (
+                f"EmptyBranches: {e}"
+            )
+            print(logg)
+        except TypeError as e:
+            logg = (
+                f"NonUniqueHead: {e}"
+            )
+        else:
+            branch = feeder_branches[0]
+            _ = self.dss.ActiveCircuit.SetActiveElement(branch)
+            element_id = self.dss.ActiveClass.Name
+            monitor_id = self.add_monitor(
+                branch, f"{element_id}_monitor_{mode}", terminal, mode
+            )
+            self.head_monitor = monitor_id
 
-    def add_head_meters(
+    def add_head_meter(
             self,
             source_bus_id: str = "sourcebus",
             terminal: int = 1,
@@ -322,16 +395,41 @@ class Network(ABC):
         To assess Topology analysis and collect global Registers.
 
         """
-        self.dss.ActiveCircuit.ActiveBus(source_bus_id)
-        feeder_branches = self.dss.ActiveCircuit.ActiveBus.AllPDEatBus
-        for branch in feeder_branches:
-            if branch:
-                _ = self.dss.ActiveCircuit.SetActiveElement(branch)
-                element_id = self.dss.ActiveClass.Name
-                meter_id = self.set_meter(
-                    branch, f"{element_id}_meter", terminal
-                )
-                self.head_meters_id.append(meter_id)
+        ibus_obj = self.dss.ActiveCircuit.ActiveBus(source_bus_id)
+        pd_elements = ibus_obj.AllPDEatBus
+        # Full name branches
+        pd_elements = self.dss.ActiveCircuit.ActiveBus.AllPDEatBus
+        pd_elements = [
+            None if (e) and (e.lower() in {"none", "nan", "null"}) else e
+            for e in pd_elements
+        ]
+        # Kick out falsy items
+        feeder_branches = list(filter(None, pd_elements))
+        # Add meter
+        try:
+            if feeder_branches:
+                n_branches = len(feeder_branches)
+                if n_branches != 1:
+                    raise TypeError("Multiple branches at head.")
+            else:
+                raise ValueError("No PDE at feeder.")
+        except ValueError as e:
+            logg = (
+                f"EmptyBranches: {e}"
+            )
+            print(logg)
+        except TypeError as e:
+            logg = (
+                f"NonUniqueHead: {e}"
+            )
+        else:
+            branch = feeder_branches[0]
+            _ = self.dss.ActiveCircuit.SetActiveElement(branch)
+            element_id = self.dss.ActiveClass.Name
+            meter_id = self.add_meter(
+                branch, f"{element_id}_meter", terminal
+            )
+            self.head_meter = meter_id
 
     def get_monitor_data(
             self,
@@ -401,6 +499,8 @@ class Network(ABC):
 
         der_name = full_name.split(".")[-1]
         full_dummy_name = f"Generator.dummy_{der_name}"
+        if full_dummy_name in self.der_dummy_names:
+            return
         bus_nodes = dssElement.Properties("Bus1").Val
         phases = dssElement.Properties("Phases").Val
         kvoltage = dssElement.Properties("kV").Val
@@ -462,20 +562,30 @@ class Network(ABC):
 
     def deploy_pce_monitors(
             self,
-            terminal: int = 1,
-            mode: int = enums.MonitorModes.Power
+            terminals: tuple[int] = (1, 1, 1),
+            modes: tuple[int] = (
+                enums.MonitorModes.Power,   # P-Q
+                enums.MonitorModes.VI,      # Volt-Curr
+                9                           # Losses
+            )
     ):
         """Connect measurement infrastructure to PCE.
 
-        Power Conversion Elements (PCE) regarding
-        the local network in order to measure losses.
+        Power Convertion Elements (PCE) regarding
+        local network in order to measure losses. Bear in mind
+        that default ``VSource`` elements it is not considered a PCE.
 
-        .. warning::
+        Classify either Power, VI or Losses kind of
+        monitors and its representation is rectangular
+        with Real and Imaginary part.
+
+        .. Warning::
             Ensure to call this method in the proper
             monitoring kind of mode.
 
         .. Note::
-            DER devices full names are internally retained.
+            DER devices full names are internally retained
+            by keys: ``Storage`` ``PVSystem``.
 
         """
         # PCE of local network
@@ -488,17 +598,26 @@ class Network(ABC):
                 if class_name in self.der_data:
                     self.catch_der(class_name, full_name)
                 element_id = self.dss.ActiveCircuit.ActiveClass.Name
-                monitor_id = self.set_monitor(
-                    full_name,
-                    f"{element_id}_monitor_{mode}",
-                    terminal,
-                    mode
-                )
-                self.losses_monitors_id.append(monitor_id)
+                for terminal, mode in zip(terminals, modes):
+                    monitor_id = self.add_monitor(
+                        full_name,
+                        f"{element_id}_monitor_{mode}",
+                        terminal,
+                        mode,
+                        polar=False
+                    )
+                    if mode == enums.MonitorModes.Power:
+                        self.power_monitors[full_name.lower()] = monitor_id
+                    elif mode == enums.MonitorModes.VI:
+                        self.volt_curr_monitors[full_name.lower()] = monitor_id
+                    elif mode == 9:
+                        self.losses_monitors[full_name.lower()] = monitor_id
+
                 i = self.dss.ActiveCircuit.NextPCElement()
 
     def deploy_switches_monitors(
-            self
+            self,
+            polar: bool = True
     ):
         """Embed voltage-current monitor to SwitchedObj."""
         dssSwitch = self.dss.ActiveCircuit.SwtControls
@@ -513,15 +632,15 @@ class Network(ABC):
             return
         else:
             for switch_id, full_name in switched_objs:
-                switch_number = switch_id.split("_")[-1]
-                monitor_id = self.set_monitor(
+                switch_number = switch_id.split("_")[-1]   # Check name
+                monitor_id = self.add_monitor(
                     full_name_element=full_name,
                     monitor_id=f"monitor_{switch_number}_vi",
                     terminal=1,
                     mode=enums.MonitorModes.VI,
-                    polar=True
+                    polar=polar
                 )
-                self.volt_curr_monitors_id.append(monitor_id)
+                self.switches_monitors.append(monitor_id)
 
     def external_network_power(
             self,
@@ -539,10 +658,9 @@ class Network(ABC):
         )
         try:
             if self.dss.ActiveCircuit.Solution.Converged:
-                for name in self.power_monitors_id:
-                    data = self.get_monitor_data(name)
-                    injected_power[:, 0] += data[:, 2::2].sum(axis=1)
-                    injected_power[:, 1] += data[:, 3::2].sum(axis=1)
+                data = self.get_monitor_data(self.head_monitor)
+                injected_power[:, 0] += data[:, 2::2].sum(axis=1)
+                injected_power[:, 1] += data[:, 3::2].sum(axis=1)
             else:
                 raise RuntimeError(
                     f"Circuit {self.dss.ActiveCircuit.Name} did not converge"
@@ -551,7 +669,7 @@ class Network(ABC):
             print(f"MaxIterReached: {e}.")
             return
         else:
-            self.feeders_power = injected_power
+            self.feeder_power = injected_power
             return injected_power
 
     def local_mismatch(
@@ -584,7 +702,7 @@ class Network(ABC):
         )
         try:
             if self.dss.ActiveCircuit.Solution.Converged:
-                for name in self.losses_monitors_id:
+                for name in self.losses_monitors.values():
                     data = self.get_monitor_data(name)
                     delta_matrix[:, 0] += data[:, 2] / 1e3  # kW
                     delta_matrix[:, 1] += data[:, 3] / 1e3  # kVAr
@@ -598,7 +716,7 @@ class Network(ABC):
         else:
             return -delta_matrix
 
-    def get_voltage_profiles(
+    def get_switched_profiles(
             self
     ) -> dict[str, np.ndarray]:
         """Get VI daily data from switched objects.
@@ -607,9 +725,52 @@ class Network(ABC):
 
         """
         data: dict[str, np.ndarray] = {}
-        for monitor_id in self.volt_curr_monitors_id:
+        for monitor_id in self.switches_monitors:
             measures = self.get_monitor_data(monitor_id)
             data[monitor_id] = measures
+        return data
+
+    def get_vi_profiles(
+            self
+    ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+        """Get VI daily data from Power Conversion Elements (PCE).
+
+        Retrain hot phases only.
+
+        Returns
+        -------
+        data : dict[str, tuple[np.ndarray, np.ndarray]]
+            Dictionary whose key is the full name PCE element
+            and its values tuples of phase voltage and current
+            respectively as complex datatype.
+
+        .. Note::
+
+            Voltage phase values are returned as p.u. based on its
+            ``kV`` asigned property which it is supossed to be
+            line to line nominal voltage.
+
+        """
+        data: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for at_element, monitor_id in self.volt_curr_monitors.items():
+            elem = self.dss.ActiveCircuit.ActiveCktElement(at_element)
+            fts = elem.Properties
+            base_v = float(fts("kV").Val) * 1e3   # kV to V
+            vi_data = self.get_monitor_data(monitor_id)
+            m = 2
+            n = m + len(elem.Voltages)
+            v = vi_data[:, m:n]  # Voltages
+            c = vi_data[:, n:]   # Currents
+            # Turn into complex data type per entry
+            v_phasors = v.reshape(len(v), -1, 2).dot([1, 1j])
+            c_phasors = c.reshape(len(c), -1, 2).dot([1, 1j])
+            # Drop dead phases
+            v_hot_phases = ~np.all(v_phasors == 0 + 0j, axis=0)
+            c_hot_phases = ~np.all(c_phasors == 0 + 0j, axis=0)
+            # Update phasors
+            v_phasors = v_phasors[:, v_hot_phases] * 1 / base_v   # pu
+            c_phasors = c_phasors[:, c_hot_phases]
+            data[at_element] = (v_phasors, c_phasors)
         return data
 
     def three_phase_fault(
@@ -761,6 +922,12 @@ class Network(ABC):
         unbalance network it gets the highest phase current measured.
 
         It slices half the array because one terminal is enough.
+
+        .. warning::
+
+            Command :py:attr:`dss.ActiveCircuit.ActiveBus.AllPDEatBus`
+            it is not reliable as may return non neighbor branches.
+            You may use :py:class:`gdss.CktGraph` to walk around.
 
         """
         fault_data: dict[str, list[str, float, np.ndarray]] = {}
@@ -926,6 +1093,7 @@ class CktGraph(ABC):
     adj: dict[str, list[str]] = field(default_factory=dict)
 
     def __post_init__(self):
+        """Set graph given the Network."""
         self.set_adjacency_list()
 
     def add_vertex(
@@ -1003,7 +1171,7 @@ class CktGraph(ABC):
                 dssBranch = dssCircuit.ActiveCktElement(edge)
                 nodes = dssBranch.BusNames
                 # Strip specific nodes
-                buses = [node.split(".")[0] for node in nodes]
+                buses = [re.sub(r'(\.\d+)+$', '', node) for node in nodes]
                 if len(set(buses)) != 2:
                     self.untwist_branch(buses)
                 else:
@@ -1023,9 +1191,11 @@ class CktGraph(ABC):
 
     def dfs_edges(
             self,
-            root: str | None = "sourcebus"
+            graph_adj: dict[str, list[str]],
+            root_bus: str | None = "sourcebus",
+            depth_limit: int | None = None
     ):
-        """Run full traversal Depth First Search.
+        """Depth First Search.
 
         To traverse graph. If ``root`` (source) is provided
         then yield only edges in the component reachable
@@ -1037,19 +1207,29 @@ class CktGraph(ABC):
         .. [1] http://www.ics.uci.edu/~eppstein/PADS
         .. [2] https://en.wikipedia.org/wiki/Depth-limited_search
 
+        .. note::
+
+            The ``root`` is not necessary the *bus head* of the
+            electrical network.
+
         """
-        if root is None:
+        if root_bus is None:
             # Edges for all components
-            vertices = self.vertices
+            vertices = list(graph_adj.keys())
         else:
             # Edges for components with source
-            vertices = [root]
+            vertices = [root_bus]
+
+        if depth_limit is None:
+            depth_limit = len(graph_adj)
+
         visited = set()
         for start in vertices:
             if start in visited:
                 continue
             visited.add(start)
-            stack = [(start, self.adj[start])]
+            stack = [(start, graph_adj[start])]
+            depth_now = 1
             while stack:
                 parent, children = stack[-1]
                 for child in children:
@@ -1057,30 +1237,63 @@ class CktGraph(ABC):
                         # Discovered edge
                         yield parent, child
                         visited.add(child)
-                        # Add child and grandchildren to stack
-                        stack.append((child, self.adj[child]))
-                        break
+                        if depth_now < depth_limit:
+                            # Add child and grandchildren to stack
+                            stack.append((child, graph_adj[child]))
+                            depth_now += 1
+                            break
                 else:
-                    stack.pop()
+                    _ = stack.pop()
+                    depth_now -= 1
+
+    def is_connected(
+            self,
+            graph_adj: dict[str, list[str]]
+    ) -> bool:
+        """Verify if graph is connected."""
+        vertices: list[str] = list(graph_adj.keys())
+        edges = self.dfs_edges(
+            graph_adj=graph_adj,
+            root_bus=vertices[0],
+            depth_limit=None
+        )
+        sub_vertices = {end for ends in edges for end in ends}
+        return len(sub_vertices) == len(vertices)
 
 
 @dataclass()
 class BaseCicuit(Network, Circuit):
     """Current circuit."""
 
+    ckt_graph: CktGraph = field(init=False)
+
     def __post_init__(self):
+        """Call Network and set base scenario."""
         super().__post_init__()
         try:
             if self.dss.ActiveCircuit.Solution.Converged:
-                self.add_head_meters()
-                self.add_head_monitors()          # Power monitors
-                self.deploy_pce_monitors(mode=9)  # Losses monitors
-                self.deploy_switches_monitors()   # VI monitors
+                self.add_head_meter()
+                self.add_head_monitor()           # Power monitor
+                self.deploy_pce_monitors()        # PQ, VI, Losses monitors
+                self.deploy_switches_monitors(polar=True)   # VI monitors
                 self.dss.ActiveCircuit.Solution.Solve()
             else:
                 raise RuntimeError("Circuit must be initialized")
         except RuntimeError as e:
             print(f"NonSolvedCkt: {e}.")
+        else:
+            self.ckt_graph = self.make_graph()
+
+    def make_graph(
+            self
+    ) -> CktGraph:
+        """Set graph of current circuit scenario.
+
+        Factory for ``ckt_graph``.
+        Override if different graph class is needed.
+
+        """
+        return CktGraph(self)
 
     def calculate_losses(
             self
@@ -1113,11 +1326,13 @@ class BaseCicuit(Network, Circuit):
         """
         fault_buses = {}
         for bus_id in self.dss.ActiveCircuit.AllBusNames:
-            if "sourcebus" in bus_id.lower():
-                continue
-            if "hvmv_3" in bus_id.lower():
-                continue
             dssBus = self.dss.ActiveCircuit.ActiveBus(bus_id)
+            skip_bus = (
+                dssBus.Name not in self.ckt_graph.vertices,
+                bus_id.lower() in {"sourcebus", "hvmv_3"}
+            )
+            if any(skip_bus):
+                continue
             nodes = dssBus.Nodes
             voltages = dssBus.VMagAngle  # mag VLN [V], phase [Deg]
             if all(voltages[::2] >= 30.0e3/np.sqrt(3)):
@@ -1148,55 +1363,79 @@ class DERCircuit(Network, Circuit):
     storages_id: list[str] = field(default_factory=list)
     pvsystems_id: list[str] = field(default_factory=list)
     volt_curr_der_monitors: list[str] = field(default_factory=list)
+    ckt_graph: CktGraph = field(init=False)
 
     def __post_init__(self):
-        """Add DER and then monitors."""
+        """Call Network, add DER and then monitors."""
         super().__post_init__()
         try:
             if self.dss.ActiveCircuit.Solution.Converged:
                 # -- DER
                 self.add_bess()
+                self.add_pv_systems()
                 # -- Measuring
-                self.add_head_meters()
-                self.add_head_monitors()          # Power monitors
-                self.deploy_pce_monitors(mode=9)  # Losses monitors
-                self.deploy_switches_monitors()   # VI monitors
-                self.deploy_bess_monitors()       # VI monitors
+                self.add_head_meter()
+                self.add_head_monitor()           # Power monitor
+                self.deploy_pce_monitors()        # PQ, VI, Losses monitors
+                self.deploy_switches_monitors(polar=True)   # VI monitors
+                self.deploy_bess_monitors(polar=True)       # VI monitors
+                self.deploy_pv_monitors(polar=True)         # VI monitors
                 self.dss.ActiveCircuit.Solution.Solve()
             else:
-                raise RuntimeError("Circuit must be initialized")
+                message: str = (
+                    "Circuit must be initialized "
+                    "and solved before adding DER"
+                )
+                raise RuntimeError(message)
         except RuntimeError as e:
             print(f"NonSolvedCkt: {e}.")
+        else:
+            self.ckt_graph = self.make_graph()
+
+    def make_graph(
+            self
+    ) -> CktGraph:
+        """Set graph of current circuit scenario.
+
+        Factory for ``ckt_graph``.
+        Override if different graph class is needed.
+
+        """
+        return CktGraph(self)
 
     def deploy_bess_monitors(
-            self
+            self,
+            polar: bool = True
     ):
         """Embed voltage-current monitor to BESS."""
         dssStorage = self.dss.ActiveCircuit.Storages
         storage_objs: list[str] = dssStorage.AllNames
-
-        if not storage_objs:
-            return
-        else:
-            for id in storage_objs:
-                if id:
-                    monitor_id = self.set_monitor(
-                        full_name_element=f"Storage.{id}",
-                        monitor_id=f"bess_monitor_{id}_vi",
-                        terminal=1,
-                        mode=enums.MonitorModes.VI,
-                        polar=True
-                    )
-                    self.volt_curr_der_monitors.append(monitor_id)
+        storage_objs = [
+            None if (e.lower() in {"none", "nan", "null"}) else e
+            for e in storage_objs if e
+        ]
+        storage_objs = list(filter(None, storage_objs))
+        for id in storage_objs or []:
+            monitor_id = self.add_monitor(
+                full_name_element=f"Storage.{id}",
+                monitor_id=f"bess_monitor_{id}_vi",
+                terminal=1,
+                mode=enums.MonitorModes.VI,
+                polar=polar
+            )
+            self.volt_curr_der_monitors.append(monitor_id)
 
     def set_bess_dispatch_curve(
             self,
             dispatch_curve_id: str = "dispatch_shape",
             npts: int = 96,
             minterval: int = 15,
-            hours_soc: tuple[tuple, tuple] = ((1, 5), (17, 20.4)),
+            hours_soc: tuple[
+                tuple[float, float], tuple[float, float]
+            ] | None = ((3, 6), (20, 27)),
             charge_pace: float = 1.0,
-            discharge_pace: float = 1.0
+            discharge_pace: float = 1.0,
+            pmult_curve: np.ndarray[float] | None = None
     ):
         """Define dynamically LoadShape.
 
@@ -1207,28 +1446,60 @@ class DERCircuit(Network, Circuit):
         hours_soc : tuple[tuple, tuple]
             Time boundaries for the State of Charge (SoC) of
             storage device where the outer tuple defines
-            if discharge or charge and the inner
+            if charge or discharge and the inner
             set the hours from and to as **24-hr** fashion.
 
         """
+
+        def hour_to_index(hour: float) -> int:
+            """Convert hour (may overflow 24) to loadshape index."""
+            hour_wrapped = hour % 24.0
+            return int((hour_wrapped / 24.0) * npts)
+
+        def apply_range(
+                arr: np.ndarray,
+                start_h: float,
+                end_h: float,
+                pace_value: float
+        ):
+            """Apply pace value on array handling wrap-around."""
+            i = hour_to_index(start_h)
+            j = hour_to_index(end_h)
+
+            if start_h % 24 <= end_h % 24:
+                # Normal non-wrap case: e.g. 1 → 5
+                arr[i:j] = pace_value
+            else:
+                # Wrap-around: e.g. 23 to 28 (where 28→4)
+                arr[i:] = pace_value      # from i to end of day
+                arr[:j] = pace_value      # from start to j
+
         dssLoadShape = self.dss.ActiveCircuit.LoadShapes
         dssLoadShape.New(dispatch_curve_id)
         dssLoadShape.Name = dispatch_curve_id
         dssLoadShape.Npts = npts
         dssLoadShape.MinInterval = minterval
-        dssLoadShape.UseActual = False
         daily_dispatch = np.zeros(npts)
 
-        # Charge (negative values)
-        i = int(npts*hours_soc[0][0] / 24.0)
-        j = int(npts*hours_soc[0][1] / 24.0)
-        # Discharge (positive values)
-        m = int(npts*hours_soc[1][0] / 24.0)
-        n = int(npts*hours_soc[1][1] / 24.0)
-        daily_dispatch[i:j] = -1.0 * charge_pace
-        daily_dispatch[m:n] = 1.0 * discharge_pace
+        if pmult_curve is not None:
+            dssLoadShape.UseActual = True
+            dssLoadShape.Pmult = pmult_curve
+        else:
+            dssLoadShape.UseActual = False
 
-        dssLoadShape.Pmult = daily_dispatch
+            # Apply charge (negative)
+            charge_from, charge_to = hours_soc[0]
+            apply_range(
+                daily_dispatch, charge_from, charge_to, -charge_pace
+            )
+
+            # Apply discharge (positive)
+            dis_from, dis_to = hours_soc[1]
+            apply_range(
+                daily_dispatch, dis_from, dis_to, discharge_pace
+            )
+
+            dssLoadShape.Pmult = daily_dispatch
 
     def set_battery(
             self,
@@ -1244,17 +1515,28 @@ class DERCircuit(Network, Circuit):
             per_reserve: float = 10.0,
             dispatch_mode: str = "follow",
             per_efficiencies: tuple[float] = (95.0, 95.0),
-            dispatch_schedule: tuple[tuple, tuple] = ((1, 5), (17, 20.4)),
+            dispatch_schedule: tuple[
+                tuple[float, float], tuple[float, float]
+            ] | None = None,
             charge_pace: float = 1.0,
-            discharge_pace: float = 1.0
+            discharge_pace: float = 1.0,
+            dispatch_curve: np.ndarray[float] | None = None
     ):
         """Integrate BESS to the circuit."""
-        self.set_bess_dispatch_curve(
-            dispatch_curve_id=daily_id,
-            hours_soc=dispatch_schedule,
-            charge_pace = charge_pace,
-            discharge_pace = discharge_pace
-        )
+        if dispatch_schedule is not None:
+            self.set_bess_dispatch_curve(
+                dispatch_curve_id=daily_id,
+                hours_soc=dispatch_schedule,
+                charge_pace=charge_pace,
+                discharge_pace=discharge_pace,
+                dispatch_curve=None
+            )
+        elif dispatch_curve is not None:
+            self.set_bess_dispatch_curve(
+                dispatch_curve_id=daily_id,
+                hours_soc=None,
+                pmult_curve=dispatch_curve
+            )
         self.dss.Text.Command = (
             f"New Storage.{storage_id} phases={phases} "
             f"bus1={bus_id} kV={kV} "
@@ -1289,11 +1571,216 @@ class DERCircuit(Network, Circuit):
         for battery in self.bess_attrs:
             self.set_battery(**battery)
 
-    def set_pv_sys(
+    def remove_batteries(
             self
     ):
-        """Creat PVSystem element within current context."""
-        return
+        """Turn off BESS elements.
+
+        .. warning::
+            Disable element by full name.
+
+        """
+        dssStorage = self.dss.ActiveCircuit.Storages
+        for storage_id in self.storages_id:
+            dssStorage.Name = storage_id   # Activate
+            dssobj = self.dss.ActiveCircuit.ActiveElement
+            try:
+                if not dssobj.Enabled:
+                    message: str = (
+                        f"The element '{storage_id}' it is "
+                        "not currently in the circuit"
+                    )
+                    raise ValueError(message)
+            except ValueError as e:
+                print(f"AlreadyDisabled: {e}.")
+            else:
+                full_name = dssobj.Name
+                self.dss.ActiveCircuit.Disable(full_name)
+
+    def deploy_pv_monitors(
+            self,
+            polar: bool = True
+    ):
+        """Embed voltage-current monitor to PV systems."""
+        iPVsys = self.dss.ActiveCircuit.PVSystems
+        pv_systems: list[str] = iPVsys.AllNames
+        pv_systems = [
+            None if (p.lower() in {"none", "nan", "null"}) else p
+            for p in pv_systems if p
+        ]
+        pv_systems = list(filter(None, pv_systems))
+
+        for id in pv_systems or []:
+            monitor_id = self.add_monitor(
+                full_name_element=f"PVSystem.{id}",
+                monitor_id=f"pv_monitor_{id}_vi",
+                terminal=1,
+                mode=enums.MonitorModes.VI,
+                polar=polar
+            )
+            self.volt_curr_der_monitors.append(monitor_id)
+
+    def set_pv_loadshape(
+            self,
+            shape_id: str,
+            npts: int = 96,
+            minterval: int = 15,
+            irradiance: np.ndarray | None = None,
+            window_hours: tuple[float, float] | None = None
+    ):
+        """Create a LoadShape object to represent irradiance / daily PV shape.
+
+        If ``irradiance`` (array-like) provided, it is
+        used directly (length must match npts). Else if ``window_hours``
+        provided, create a triangular/simple window across those hours.
+        Otherwise create a flat shape of ones.
+
+        """
+        dssLoadShape = self.dss.ActiveCircuit.LoadShapes
+        dssLoadShape.New(shape_id)
+        dssLoadShape.Name = shape_id
+        dssLoadShape.Npts = npts
+        dssLoadShape.MinInterval = minterval
+        dssLoadShape.UseActual = False
+
+        if irradiance is not None:
+            arr = np.asarray(irradiance, dtype=float)
+            try:
+                if arr.size != npts:
+                    message: str = (
+                        f"Irradiance length ({arr.size}) != "
+                        f"npts ({npts})"
+                    )
+                    raise ValueError(message)
+            except ValueError as e:
+                print(f"InvalidLoadshape: {e}")
+                return
+            else:
+                pmult = arr
+        elif window_hours:
+            # Create a smooth window (raised cosine) in the given hours
+            pmult = np.zeros(npts)
+            start = int(npts * window_hours[0] / 24.0)
+            stop = int(npts * window_hours[1] / 24.0)
+            if stop <= start:
+                stop = start + 1
+            width = stop - start
+            x = np.linspace(-np.pi/2, np.pi/2, width)
+            window = np.cos(x) ** 2  # smooth bell-like
+            pmult[start:stop] = window
+        else:
+            pmult = np.ones(npts)
+
+        dssLoadShape.Pmult = pmult
+
+    def set_pv_sys(
+                self,
+                pv_id: str,
+                bus_id: str,
+                phases: int = 3,
+                kV: float = 0.4,
+                kVA: float | None = None,
+                pf: float = 1.0,
+                conn: str = "wye",
+                model: int = 1,
+                daily_shape_id: str | None = None,
+                irradiance: np.ndarray[float] = None,
+                window_hours: tuple[float, float] = None,
+                npts: int = 96,
+                minterval: int = 15,
+                pmpp: float = None,
+                enabled: bool = True,
+                **extra
+    ):
+        """Create a PVSystem and optionally a daily irradiance/loadshape.
+
+        Parameters
+        ----------
+
+        pv_id : str
+            identifier (will create PVSystem.<pv_id>).
+        bus_id : str
+            bus to connect (string).
+        phases , int
+            kV, kW: electrical sizing.
+        kVA : float
+            inverter rating; if None, set to kW (assumes pf=1).
+        pf : float
+            power factor for generator mode (if using Pgen type behavior).
+        daily_shape_id : str
+            name of existing LoadShape; if not given and irradiance
+            or window provided, a shape will be created.
+        irradiance : np.ndarray[float]
+            optional array for shape creation.
+        window_hours : tuple[float, float]
+            optional simple daily window (e.g. (6, 18)).
+        pmpp : float
+            peak-power point parameter (optional).
+        extra : **kwargs
+            forwarded to DSS command as additional properties.
+
+        """
+        if (daily_shape_id is None) and (
+            irradiance is not None or window_hours is not None
+        ):
+            daily_shape_id = f"{pv_id}_irradiance"
+            self.set_pv_loadshape(
+                daily_shape_id,
+                npts=npts,
+                minterval=minterval,
+                irradiance=irradiance,
+                window_hours=window_hours
+            )
+
+        # Build DSS command; include commonly used parameters
+        cmd_parts = [
+            f"New PVSystem.{pv_id}",
+            f"phases={phases}",
+            f"bus1={bus_id}",
+            f"kV={kV}",
+            f"kVA={kVA}",
+            f"%cutin=0",      # Defaults - can be overridden via extra
+            f"conn={conn}",
+            f"model={model}"
+        ]
+        if daily_shape_id:
+            cmd_parts.append(f"daily={daily_shape_id}")
+        if pmpp is not None:
+            cmd_parts.append(f"pmpp={pmpp}")
+        if pf is not None:
+            cmd_parts.append(f"pf={pf}")
+
+        # Extra keyword args forwarded as key=value
+        for k, v in extra.items():
+            cmd_parts.append(f"{k}={v}")
+
+        cmd = " ".join(cmd_parts)
+        self.dss.Text.Command = cmd
+
+        # Validate creation and optionally enable/state handling
+        try:
+            # Select PVSystem by name and check active element
+            self.dss.ActiveCircuit.SetActiveElement(f"PVSystem.{pv_id}")
+            active_name = self.dss.ActiveCircuit.ActiveElement.Name
+            if active_name.lower() != f"pvsystem.{pv_id}".lower():
+                message: str = (
+                    f"PVSystem {pv_id} not found after creation "
+                    f"(active element {active_name})"
+                )
+                raise ValueError(message)
+        except Exception as e:
+            logg: str = (
+                "ElementNotFound or creation error for PVSystem "
+                f"{pv_id}: {e}"
+            )
+            print(logg)
+            return
+        else:
+            if not enabled:
+                # Disable the element if user requested
+                self.dss.ActiveCircuit.Disable(active_name)
+
+            self.pvsystems_id.append(f"PVSystem.{pv_id}")
 
     def add_pv_systems(
             self
@@ -1302,33 +1789,31 @@ class DERCircuit(Network, Circuit):
         for pv_sys in self.pvsys_attrs:
             self.set_pv_sys(**pv_sys)
 
-    def remove_batteries(
-            self
-    ):
-        """Turn off BESS elements.
-
-        .. warning::
-            Disable element through full name.
-
-        """
-        dssStorage = self.dss.ActiveCircuit.Storages
-        for storage_id in self.storages_id:
-            dssStorage.Name = storage_id   # Activate
-            full_name = self.dss.ActiveCircuit.ActiveElement.Name
-            self.dss.ActiveCircuit.Disable(full_name)
-
     def remove_pv_systems(
             self
     ):
-        """Turn off PVSystems
+        """Turn off PVSystems.
 
         .. warning::
-            Disable element thorugh full name.
+            Disable element by full name.
 
         """
-
+        dssPV = self.dss.ActiveCircuit.PVSystems
         for pv_id in self.pvsystems_id:
-            self.dss.ActiveCircuit.Disable(pv_id)
+            dssPV.Name = pv_id   # Activate
+            dssobj = self.dss.ActiveCircuit.ActiveElement
+            try:
+                if not dssobj.Enabled:
+                    message: str = (
+                        f"The element '{pv_id}' it is "
+                        "not currently in the circuit"
+                    )
+                    raise ValueError(message)
+            except ValueError as e:
+                print(f"AlreadyDisabled: {e}.")
+            else:
+                full_name = dssobj.Name
+                self.dss.ActiveCircuit.Disable(full_name)
 
     def calculate_losses(
             self
@@ -1361,11 +1846,13 @@ class DERCircuit(Network, Circuit):
         """
         fault_buses = {}
         for bus_id in self.dss.ActiveCircuit.AllBusNames:
-            if "sourcebus" in bus_id.lower():
-                continue
-            if "hvmv_3" in bus_id.lower():
-                continue
             dssBus = self.dss.ActiveCircuit.ActiveBus(bus_id)
+            skip_bus = (
+                dssBus.Name not in self.ckt_graph.vertices,
+                bus_id.lower() in {"sourcebus", "hvmv_3"}
+            )
+            if any(skip_bus):
+                continue
             nodes = dssBus.Nodes
             voltages = dssBus.VMagAngle  # mag VLN [V], phase [Deg]
             if all(voltages[::2] >= 30.0e3/np.sqrt(3)):
