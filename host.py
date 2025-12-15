@@ -242,7 +242,7 @@ class Network(ABC):
     losses_monitors:  dict[str, str] = field(default_factory=dict)
     volt_curr_monitors: dict[str, str] = field(default_factory=dict)
     switches_monitors: list[str] = field(default_factory=list)
-    head_monitor: str | None = None   # PWR
+    head_monitors: list[str, str] = field(default_factory=list)  # PWR, VI
     head_meter:  str | None = None
     mv_buses_id: list[str] = field(default_factory=list)
     lv_buses_id: list[str] = field(default_factory=list)
@@ -344,9 +344,25 @@ class Network(ABC):
             terminal: int = 1,
             mode: int = enums.MonitorModes.Power
     ):
-        """Deploy monitors to each PDE connected to sourcebus.
+        """Deploy monitors to first PDE connected to sourcebus.
 
-        To keep an eye on external network power.
+        To keep an eye on external network modeled as
+        the main circuit source.
+
+        Raises
+        ------
+        TypeError
+            As only and solely one PDE must be connected
+            to this sourcebus.
+
+        ValueError
+            Floating sourcebus.
+
+        .. warning::
+
+            The command :py:attr:`iBus.AllPDEatBus` it is not reliable
+            as may return branches whose Bus has not connections
+            at all.
 
         """
         ibus_obj = self.dss.ActiveCircuit.ActiveBus(source_bus_id)
@@ -359,7 +375,7 @@ class Network(ABC):
         ]
         # Kick out falsy items
         feeder_branches = list(filter(None, pd_elements))
-        # Add monitor
+        # Add monitor, check for unique item
         try:
             if feeder_branches:
                 n_branches = len(feeder_branches)
@@ -377,22 +393,37 @@ class Network(ABC):
                 f"NonUniqueHead: {e}"
             )
         else:
-            branch = feeder_branches[0]
+            branch = feeder_branches[0]   # Full name without nodes
             _ = self.dss.ActiveCircuit.SetActiveElement(branch)
             element_id = self.dss.ActiveClass.Name
             monitor_id = self.add_monitor(
                 branch, f"{element_id}_monitor_{mode}", terminal, mode
             )
-            self.head_monitor = monitor_id
+            self.head_monitors.append(monitor_id)
 
     def add_head_meter(
             self,
             source_bus_id: str = "sourcebus",
             terminal: int = 1,
     ):
-        """Embed EnergyMeter right at feeders head.
+        """Embed EnergyMeter right at feeder's head.
 
         To assess Topology analysis and collect global Registers.
+
+        Raises
+        ------
+        TypeError
+            As only and solely one PDE must be connected
+            to this sourcebus.
+
+        ValueError
+            Floating sourcebus.
+
+        .. warning::
+
+            The command :py:attr:`iBus.AllPDEatBus` it is not reliable
+            as may return branches whose Bus has not connections
+            at all.
 
         """
         ibus_obj = self.dss.ActiveCircuit.ActiveBus(source_bus_id)
@@ -658,7 +689,8 @@ class Network(ABC):
         )
         try:
             if self.dss.ActiveCircuit.Solution.Converged:
-                data = self.get_monitor_data(self.head_monitor)
+                pwr_monitor = self.head_monitors[0]
+                data = self.get_monitor_data(pwr_monitor)
                 injected_power[:, 0] += data[:, 2::2].sum(axis=1)
                 injected_power[:, 1] += data[:, 3::2].sum(axis=1)
             else:
@@ -1273,7 +1305,8 @@ class BaseCicuit(Network, Circuit):
         try:
             if self.dss.ActiveCircuit.Solution.Converged:
                 self.add_head_meter()
-                self.add_head_monitor()           # Power monitor
+                self.add_head_monitor(mode=enums.MonitorModes.Power)
+                self.add_head_monitor(mode=enums.MonitorModes.VI)
                 self.deploy_pce_monitors()        # PQ, VI, Losses monitors
                 self.deploy_switches_monitors(polar=True)   # VI monitors
                 self.dss.ActiveCircuit.Solution.Solve()
@@ -1375,7 +1408,8 @@ class DERCircuit(Network, Circuit):
                 self.add_pv_systems()
                 # -- Measuring
                 self.add_head_meter()
-                self.add_head_monitor()           # Power monitor
+                self.add_head_monitor(mode=enums.MonitorModes.Power)
+                self.add_head_monitor(mode=enums.MonitorModes.VI)
                 self.deploy_pce_monitors()        # PQ, VI, Losses monitors
                 self.deploy_switches_monitors(polar=True)   # VI monitors
                 self.deploy_bess_monitors(polar=True)       # VI monitors
@@ -1696,7 +1730,6 @@ class DERCircuit(Network, Circuit):
 
         Parameters
         ----------
-
         pv_id : str
             identifier (will create PVSystem.<pv_id>).
         bus_id : str
