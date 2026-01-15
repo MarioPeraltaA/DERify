@@ -235,7 +235,7 @@ class Network(ABC):
     stepsize_min: int = 15
     to_solve: bool = True
     feeder_power: np.ndarray[float] | None = None
-    der_data = {"Storage": [], "PVSystem": []}
+    der_data: dict = field(default_factory=dict, init=False)
     der_names: list = field(default_factory=list)
     der_dummy_names: list = field(default_factory=list)
     power_monitors:  dict[str, str] = field(default_factory=dict)
@@ -256,6 +256,7 @@ class Network(ABC):
             self
     ):
         """Load and solve circuit."""
+        self.der_data = {"Storage": [], "PVSystem": []}
         self.dss = dss.NewContext()
         self.load_ckt()
 
@@ -562,6 +563,7 @@ class Network(ABC):
                 self.dss.Text.Command = generator
                 if not enabled:
                     self.dss.Text.Command = f"Disable {dummy_id}"
+        self.dss.ActiveCircuit.Solution.Solve()
 
     def flip_der(
             self
